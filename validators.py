@@ -31,7 +31,13 @@ def validate_hex_color(value: str) -> None:
 def validate_theme_dir(path: Path, home: Path) -> None:
     current_theme_root = (home / ".config/omarchy/current/theme").resolve()
     named_themes_root = (home / ".config/omarchy/themes").resolve()
+    raw = path.expanduser().absolute()
     resolved = path.resolve()
+
+    raw_in_current_root = raw == current_theme_root or current_theme_root in raw.parents
+    raw_in_named_root = raw == named_themes_root or named_themes_root in raw.parents
+    if raw_in_current_root or raw_in_named_root:
+        return
 
     in_current_root = resolved == current_theme_root or current_theme_root in resolved.parents
     in_named_root = resolved == named_themes_root or named_themes_root in resolved.parents
