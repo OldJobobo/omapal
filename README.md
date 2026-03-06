@@ -10,6 +10,7 @@
 
 ```bash
 python omapal.py --help
+python omapal.py --version
 ```
 
 Default behavior with no arguments is interactive mode. If `gum` is installed, menus and reports use `gum`.
@@ -17,6 +18,12 @@ Default behavior with no arguments is interactive mode. If `gum` is installed, m
 ```bash
 python omapal.py
 ```
+
+Interactive mode includes:
+- themed preflight panel
+- themed menus/prompts/confirm dialogs
+- `Show Palette` with boxed palette view, ANSI `color0`-`color15` grid, and separate core-token grid
+- styled sync/diff report output with summaries
 
 ## Commands
 
@@ -71,4 +78,20 @@ Run tests:
 
 ```bash
 pytest
+```
+
+Version management:
+
+```bash
+python versioning.py current
+python versioning.py bump patch
+python versioning.py bump minor --dry-run
+python versioning.py set 1.2.0
+```
+
+Installed console entrypoint:
+
+```bash
+omapal-version current
+omapal-version bump patch
 ```

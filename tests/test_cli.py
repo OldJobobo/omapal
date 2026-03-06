@@ -14,6 +14,14 @@ def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
     assert "Omarchy palette manager" in captured.out
 
 
+def test_version_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--version"])
+    assert exc_info.value.code == 0
+    captured = capsys.readouterr()
+    assert "omapal 0.1.0" in captured.out
+
+
 def test_no_args_enters_interactive_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(omapal, "interactive_main", lambda: 7)
     assert main([]) == 7
@@ -1425,3 +1433,38 @@ def test_sync_fails_when_zed_template_missing(
 def test_resolve_theme_name_uses_logical_theme_dir_name_for_symlinked_theme() -> None:
     theme_dir = Path("/home/user/.config/omarchy/themes/sparta")
     assert resolve_theme_name(None, theme_dir) == "sparta"
+
+
+def test_interactive_colors_from_theme_uses_theme_palette_values() -> None:
+    colors = omapal.interactive_colors_from_theme(
+        {
+            "foreground": "#d2b476",
+            "accent": "#c46f34",
+            "cursor": "#f0a80f",
+            "selection_foreground": "#171212",
+            "color1": "#f93e2e",
+            "color2": "#4f6c31",
+            "color3": "#f0a80f",
+            "color5": "#c46f34",
+            "color6": "#5f858f",
+            "color7": "#d2b476",
+            "color8": "#5c4d25",
+            "color10": "#6f9f41",
+            "color14": "#8fe0de",
+        }
+    )
+    assert colors["info"] == "6"
+    assert colors["success"] == "2"
+    assert colors["warning"] == "3"
+    assert colors["error"] == "1"
+    assert colors["muted"] == "8"
+    assert colors["header"] == "5"
+    assert colors["cursor"] == "14"
+    assert colors["selected"] == "10"
+    assert colors["item"] == "7"
+
+
+def test_interactive_colors_from_theme_falls_back_to_defaults() -> None:
+    defaults = omapal.default_interactive_colors()
+    colors = omapal.interactive_colors_from_theme({})
+    assert colors == defaults

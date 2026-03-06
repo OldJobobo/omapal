@@ -38,6 +38,7 @@ from mappings import (
     WOFI_CSS_COLOR_MAP,
 )
 from validators import validate_hex_color, validate_theme_dir, validate_token
+from version import __version__
 from writers import atomic_write, backup_file
 
 DEFAULT_AETHER_ZED_TEMPLATE = Path(__file__).resolve().parent / "templates" / "aether.zed.json"
@@ -48,6 +49,7 @@ TEMPLATE_VAR_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="omapal", description="Omarchy palette manager")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--no-interactive", action="store_true", help="Disable interactive mode")
     subparsers = parser.add_subparsers(dest="command", required=False)
 
@@ -1130,45 +1132,232 @@ def update_swayosd_css_dry_run(content: str, colors: dict[str, str]) -> tuple[st
 class InteractiveUI:
     def __init__(self, use_gum: bool) -> None:
         self.use_gum = use_gum
+        self.colors = default_interactive_colors()
+        self._reset_report_summary()
 
     @classmethod
     def autodetect(cls) -> "InteractiveUI":
         return cls(use_gum=shutil.which("gum") is not None)
 
+    def _gum_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        env.pop("NO_COLOR", None)
+        env["CLICOLOR_FORCE"] = "1"
+        env["FORCE_COLOR"] = "1"
+        return env
+
     def _run_gum(self, args: list[str]) -> str:
-        proc = subprocess.run(["gum", *args], check=True, capture_output=True, text=True)
+        proc = subprocess.run(
+            ["gum", *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=self._gum_env(),
+        )
         return proc.stdout.strip()
 
+    def _run_gum_display(self, args: list[str]) -> None:
+        subprocess.run(["gum", *args], check=True, env=self._gum_env())
+
+    def _run_gum_interactive(self, args: list[str]) -> str:
+        # Use controlling terminal directly for interactive gum commands.
+        with open("/dev/tty", "r+", encoding="utf-8", errors="ignore") as tty:
+            proc = subprocess.run(
+                ["gum", *args],
+                check=True,
+                stdin=tty,
+                stdout=subprocess.PIPE,
+                stderr=tty,
+                text=True,
+                env=self._gum_env(),
+            )
+        return proc.stdout.strip()
+
+    def apply_theme_colors(self, theme_colors: dict[str, str]) -> None:
+        self.colors = interactive_colors_from_theme(theme_colors)
+
+    def panel(self, title: str, lines: list[str], tone: str = "info") -> None:
+        message = "\n".join([title, *lines])
+        if self.use_gum:
+            border_color = self.colors.get(tone, self.colors["info"])
+            try:
+                self._run_gum_display(
+                    [
+                        "style",
+                        "--border",
+                        "rounded",
+                        "--border-foreground",
+                        border_color,
+                        "--padding",
+                        "0 1",
+                        "--margin",
+                        "1 0",
+                        message,
+                    ]
+                )
+                return
+            except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+                self.use_gum = False
+        print(message)
+
+    def color_text(self, text: str, color: str, bold: bool = False) -> str:
+        if not sys.stdout.isatty():
+            return text
+        prefix = "\x1b[1m" if bold else ""
+        return f"{prefix}\x1b[38;5;{color}m{text}\x1b[0m"
+
+    def kv_line(self, key: str, value: str, key_tone: str = "header", value_tone: str = "item") -> str:
+        key_col = self.colors.get(key_tone, self.colors["header"])
+        value_col = self.colors.get(value_tone, self.colors["item"])
+        return f"{self.color_text(key, key_col, bold=True)}: {self.color_text(value, value_col)}"
+
+    def hex_swatch(self, hex_value: str, width: int = 8) -> str:
+        if not sys.stdout.isatty():
+            return "[]"
+        match = re.fullmatch(r"#([0-9A-Fa-f]{6})", hex_value)
+        if not match:
+            return ""
+        rgb = match.group(1)
+        r = int(rgb[0:2], 16)
+        g = int(rgb[2:4], 16)
+        b = int(rgb[4:6], 16)
+        return f"\x1b[48;2;{r};{g};{b}m{' ' * width}\x1b[0m"
+
+    def _strip_ansi(self, text: str) -> str:
+        return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+    def print_box(self, title: str, lines: list[str], tone: str = "info") -> None:
+        if not sys.stdout.isatty():
+            print(title)
+            for line in lines:
+                print(self._strip_ansi(line))
+            return
+        border_color = self.colors.get(tone, self.colors["info"])
+        top_left, top_right, bottom_left, bottom_right = "╭", "╮", "╰", "╯"
+        horizontal, vertical = "─", "│"
+        text_lines = [title, *lines]
+        width = max(len(self._strip_ansi(line)) for line in text_lines) if text_lines else 0
+        top = f"{self.color_text(top_left + (horizontal * (width + 2)) + top_right, border_color)}"
+        bottom = f"{self.color_text(bottom_left + (horizontal * (width + 2)) + bottom_right, border_color)}"
+        print(top)
+        for line in text_lines:
+            pad = " " * (width - len(self._strip_ansi(line)))
+            print(f"{self.color_text(vertical, border_color)} {line}{pad} {self.color_text(vertical, border_color)}")
+        print(bottom)
+
+    def _fg_for_bg(self, r: int, g: int, b: int) -> str:
+        luminance = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255
+        return "0;0;0" if luminance > 0.6 else "255;255;255"
+
+    def color_cell(self, text: str, hex_value: str, width: int = 14) -> str:
+        match = re.fullmatch(r"#([0-9A-Fa-f]{6})", hex_value)
+        padded = text.ljust(width)
+        if not match or not sys.stdout.isatty():
+            return padded
+        rgb = match.group(1)
+        r = int(rgb[0:2], 16)
+        g = int(rgb[2:4], 16)
+        b = int(rgb[4:6], 16)
+        fg = self._fg_for_bg(r, g, b)
+        return f"\x1b[48;2;{r};{g};{b}m\x1b[38;2;{fg}m{padded}\x1b[0m"
+
+    def max_grid_columns(self, cell_width: int = 14, max_cols: int = 6, min_cols: int = 3) -> int:
+        term_width = shutil.get_terminal_size((96, 20)).columns
+        cols = max(1, (term_width + 1) // (cell_width + 1))
+        return max(min_cols, min(max_cols, cols))
+
+    def _reset_report_summary(self) -> None:
+        self._report_mode = ""
+        self._report_theme = ""
+        self._report_changed_files: list[str] = []
+        self._report_total_changes = 0
+        self._report_no_change_files = 0
+        self._report_missing_files = 0
+        self._report_errors = 0
+
+    def begin_report(self, mode: str, theme: str) -> None:
+        self._reset_report_summary()
+        self._report_mode = mode
+        self._report_theme = theme
+
+    def end_report(self) -> None:
+        if not self._report_mode:
+            return
+        changed_count = len(self._report_changed_files)
+        lines = [
+            self.kv_line("mode", self._report_mode, key_tone="header", value_tone="info"),
+            self.kv_line("theme", self._report_theme, key_tone="header", value_tone="success"),
+            self.kv_line("files changed", str(changed_count), key_tone="header", value_tone="warning"),
+            self.kv_line("total changes", str(self._report_total_changes), key_tone="header", value_tone="info"),
+            self.kv_line("unchanged", str(self._report_no_change_files), key_tone="header", value_tone="muted"),
+            self.kv_line("missing", str(self._report_missing_files), key_tone="header", value_tone="muted"),
+            self.kv_line("errors", str(self._report_errors), key_tone="header", value_tone="error"),
+        ]
+        if changed_count:
+            sample = ", ".join(self._report_changed_files[:5])
+            if changed_count > 5:
+                sample = f"{sample}, +{changed_count - 5} more"
+            lines.append(self.kv_line("changed targets", sample, key_tone="header", value_tone="item"))
+        tone = "error" if self._report_errors else ("success" if changed_count else "muted")
+        title = self.color_text("Run Summary", self.colors["header"], bold=True)
+        self.print_box(title, lines, tone=tone)
+        self._reset_report_summary()
+
     def info(self, message: str) -> None:
-        self._styled(message, "4")
+        self._styled(message, self.colors["info"])
 
     def success(self, message: str) -> None:
-        self._styled(message, "2")
+        self._styled(message, self.colors["success"])
 
     def warning(self, message: str) -> None:
-        self._styled(message, "3")
+        self._styled(message, self.colors["warning"])
 
     def error(self, message: str) -> None:
-        self._styled(message, "1")
+        self._styled(message, self.colors["error"])
 
     def muted(self, message: str) -> None:
-        self._styled(message, "8")
+        self._styled(message, self.colors["muted"])
 
     def _styled(self, message: str, color: str) -> None:
         if self.use_gum:
             try:
-                out = self._run_gum(["style", "--foreground", color, message])
-                print(out)
+                self._run_gum_display(["style", "--foreground", color, message])
                 return
-            except (subprocess.CalledProcessError, FileNotFoundError):
+            except (subprocess.CalledProcessError, FileNotFoundError, OSError):
                 self.use_gum = False
         print(message)
 
     def choose(self, header: str, options: list[str]) -> str | None:
         if self.use_gum:
             try:
-                return self._run_gum(["choose", "--header", header, *options]) or None
-            except (subprocess.CalledProcessError, FileNotFoundError):
+                return (
+                    self._run_gum_interactive(
+                        [
+                            "choose",
+                            "--header",
+                            header,
+                            "--cursor",
+                            "❯ ",
+                            "--cursor-prefix",
+                            "  ",
+                            "--selected-prefix",
+                            "✓ ",
+                            "--unselected-prefix",
+                            "  ",
+                            "--header.foreground",
+                            self.colors["header"],
+                            "--cursor.foreground",
+                            self.colors["cursor"],
+                            "--selected.foreground",
+                            self.colors["selected"],
+                            "--item.foreground",
+                            self.colors["item"],
+                            *options,
+                        ]
+                    )
+                    or None
+                )
+            except (subprocess.CalledProcessError, FileNotFoundError, OSError):
                 self.use_gum = False
         print(header)
         for i, option in enumerate(options, start=1):
@@ -1188,32 +1377,109 @@ class InteractiveUI:
                 args = ["input", "--prompt", f"{prompt}: "]
                 if placeholder:
                     args += ["--placeholder", placeholder]
-                return self._run_gum(args)
-            except (subprocess.CalledProcessError, FileNotFoundError):
+                args += [
+                    "--prompt.foreground",
+                    self.colors["header"],
+                    "--cursor.foreground",
+                    self.colors["cursor"],
+                    "--placeholder.foreground",
+                    self.colors["muted"],
+                ]
+                return self._run_gum_interactive(args)
+            except (subprocess.CalledProcessError, FileNotFoundError, OSError):
                 self.use_gum = False
         return input(f"{prompt}: ").strip()
 
     def confirm(self, prompt: str) -> bool:
         if self.use_gum:
             try:
-                subprocess.run(["gum", "confirm", prompt], check=True)
+                with open("/dev/tty", "r+", encoding="utf-8", errors="ignore") as tty:
+                    subprocess.run(
+                        [
+                            "gum",
+                            "confirm",
+                            prompt,
+                            "--prompt.foreground",
+                            self.colors["header"],
+                            "--selected.foreground",
+                            self.colors["selected"],
+                            "--unselected.foreground",
+                            self.colors["muted"],
+                        ],
+                        check=True,
+                        stdin=tty,
+                        stdout=tty,
+                        stderr=tty,
+                        env=self._gum_env(),
+                    )
                 return True
             except subprocess.CalledProcessError:
                 return False
-            except FileNotFoundError:
+            except (FileNotFoundError, OSError):
                 self.use_gum = False
         answer = input(f"{prompt} [y/N]: ").strip().lower()
         return answer in {"y", "yes"}
 
     def report_line(self, line: str) -> None:
+        changed_match = re.match(r"^([^:]+): (\d+) change\(s\)$", line)
+        if changed_match:
+            file_name = changed_match.group(1)
+            change_count = int(changed_match.group(2))
+            self._report_changed_files.append(file_name)
+            self._report_total_changes += change_count
+            label = self.color_text("PLAN", self.colors["warning"], bold=True)
+            target = self.color_text(file_name, self.colors["header"], bold=True)
+            detail = self.color_text(f"{change_count} change(s)", self.colors["item"])
+            print(f"{label} {target}: {detail}")
+            return
+
+        if line.endswith(": no changes"):
+            self._report_no_change_files += 1
+            label = self.color_text("SKIP", self.colors["muted"], bold=True)
+            print(f"{label} {line}")
+            return
+
+        if line.endswith(": skipped (missing file)"):
+            self._report_missing_files += 1
+            label = self.color_text("MISS", self.colors["muted"], bold=True)
+            print(f"{label} {line}")
+            return
+
         if ": error (" in line:
-            self.error(line)
-        elif "change(s)" in line or line.startswith("  - "):
-            self.warning(line)
-        elif "no changes" in line or "skipped (missing file)" in line:
-            self.muted(line)
-        elif line.startswith("sync: wrote") or line.startswith("sync: backups") or line.startswith("sync: reload"):
-            self.success(line)
+            self._report_errors += 1
+            self.error(f"ERR  {line}")
+            return
+
+        change_detail = re.match(r"^\s+-\s+([^:]+):\s+(#[0-9A-Fa-f]{6})\s+->\s+(#[0-9A-Fa-f]{6})$", line)
+        if change_detail:
+            token = self.color_text(change_detail.group(1), self.colors["header"], bold=True)
+            old_hex = change_detail.group(2)
+            new_hex = change_detail.group(3)
+            old_text = self.color_text(old_hex, self.colors["muted"])
+            new_text = self.color_text(new_hex, self.colors["success"])
+            old_swatch = self.hex_swatch(old_hex, width=4)
+            new_swatch = self.hex_swatch(new_hex, width=4)
+            print(f"  • {token}: {old_text} {old_swatch} -> {new_text} {new_swatch}")
+            return
+
+        if line.startswith("sync: wrote") or line.startswith("sync: backups") or line.startswith("sync: reload"):
+            self.success(f"OK   {line}")
+            return
+
+        if line.startswith("sync: mode="):
+            self.info(self.color_text(line, self.colors["header"], bold=True))
+            return
+
+        if line.startswith("sync: total planned changes=") or line.startswith("diff: total changes="):
+            self.info(self.color_text(line, self.colors["info"], bold=True))
+            return
+
+        if line.startswith("diff: theme="):
+            self.info(self.color_text(line, self.colors["header"], bold=True))
+            return
+
+        if line.startswith("  - "):
+            self.warning(f"CHG {line}")
         else:
             self.info(line)
 
@@ -1221,10 +1487,12 @@ class InteractiveUI:
 def interactive_main() -> int:
     ui = InteractiveUI.autodetect()
     theme: str | None = None
+    apply_interactive_theme_colors(ui, theme)
     if ui.use_gum:
         ui.success("Interactive mode enabled (gum)")
     else:
         ui.warning("gum not found; using plain prompts")
+    show_interactive_preflight(ui, theme)
 
     while True:
         context = theme or "active"
@@ -1249,6 +1517,7 @@ def interactive_main() -> int:
             if run_set_interactive(ui, theme) != 0:
                 return 2
         elif choice == "Sync (Preview)":
+            ui.begin_report(mode="sync-preview", theme=theme or "active")
             code = run_sync(
                 theme=theme,
                 write=False,
@@ -1259,12 +1528,14 @@ def interactive_main() -> int:
                 reporter=ui.report_line,
                 err_reporter=ui.error,
             )
+            ui.end_report()
             if code != 0:
                 return code
         elif choice == "Sync (Apply)":
             if not ui.confirm("Apply sync changes?"):
                 continue
             reload_choice = ui.choose("Reload mode", ["auto", "full", "hypr", "no-reload"]) or "auto"
+            ui.begin_report(mode="sync-apply", theme=theme or "active")
             code = run_sync(
                 theme=theme,
                 write=True,
@@ -1275,16 +1546,21 @@ def interactive_main() -> int:
                 reporter=ui.report_line,
                 err_reporter=ui.error,
             )
+            ui.end_report()
             if code != 0:
                 return code
         elif choice == "Diff":
+            ui.begin_report(mode="diff", theme=theme or "active")
             code = run_diff(theme=theme, zed_template=None, reporter=ui.report_line, err_reporter=ui.error)
+            ui.end_report()
             if code != 0:
                 return code
         elif choice == "Theme Context":
             selection = ui.choose("Theme selection", ["Use active theme", "Use named theme", "Back"])
             if selection == "Use active theme":
                 theme = None
+                apply_interactive_theme_colors(ui, theme)
+                show_interactive_preflight(ui, theme)
                 ui.success("Theme context set to active")
             elif selection == "Use named theme":
                 named = ui.prompt("Theme name", "sparta")
@@ -1292,17 +1568,126 @@ def interactive_main() -> int:
                     continue
                 resolve_theme_dir(named)
                 theme = named
+                apply_interactive_theme_colors(ui, theme)
+                show_interactive_preflight(ui, theme)
                 ui.success(f"Theme context set to {named}")
+
+
+def default_interactive_colors() -> dict[str, str]:
+    return {
+        "info": "4",
+        "success": "2",
+        "warning": "3",
+        "error": "1",
+        "muted": "8",
+        "header": "6",
+        "cursor": "14",
+        "selected": "10",
+        "item": "15",
+    }
+
+
+def interactive_colors_from_theme(theme_colors: dict[str, str]) -> dict[str, str]:
+    defaults = default_interactive_colors()
+    # Use terminal palette slots so UI colors track the active terminal theme.
+    def slot(token: str, fallback: str) -> str:
+        if token in theme_colors and token.startswith("color"):
+            return token[5:]
+        return fallback
+
+    return {
+        "info": slot("color6", defaults["info"]),
+        "success": slot("color2", defaults["success"]),
+        "warning": slot("color3", defaults["warning"]),
+        "error": slot("color1", defaults["error"]),
+        "muted": slot("color8", defaults["muted"]),
+        "header": slot("color5", defaults["header"]),
+        "cursor": slot("color14", defaults["cursor"]),
+        "selected": slot("color10", defaults["selected"]),
+        "item": slot("color7", defaults["item"]),
+    }
+
+
+def apply_interactive_theme_colors(ui: InteractiveUI, theme: str | None) -> None:
+    try:
+        theme_dir = resolve_theme_dir(theme)
+        theme_colors = read_colors_toml(theme_dir / "colors.toml")
+    except (ValueError, OSError):
+        ui.colors = default_interactive_colors()
+        return
+    ui.apply_theme_colors(theme_colors)
+
+
+def show_interactive_preflight(ui: InteractiveUI, theme: str | None) -> None:
+    try:
+        theme_dir = resolve_theme_dir(theme)
+        lines = [
+            ui.kv_line("context", theme or "active", key_tone="header", value_tone="success"),
+            ui.kv_line("theme dir", str(theme_dir), key_tone="header", value_tone="info"),
+            ui.kv_line("gum ui", "enabled" if ui.use_gum else "disabled", key_tone="header", value_tone="warning"),
+            ui.kv_line("sync targets", f"{len(SYNC_TARGET_FILES)} files", key_tone="header", value_tone="muted"),
+        ]
+        title = ui.color_text("Preflight", ui.colors["header"], bold=True)
+        ui.panel(title, lines, tone="info")
+    except (ValueError, OSError) as err:
+        title = ui.color_text("Preflight", ui.colors["warning"], bold=True)
+        warn_line = ui.kv_line("theme resolution warning", str(err), key_tone="warning", value_tone="error")
+        ui.panel(title, [warn_line], tone="warning")
 
 
 def run_show_interactive(ui: InteractiveUI, theme: str | None) -> int:
     theme_dir = resolve_theme_dir(theme)
     colors = read_colors_toml(theme_dir / "colors.toml")
-    ui.info(f"show: theme={theme or 'active'} path={theme_dir}")
-    for token in CANONICAL_TOKENS:
-        if token in colors:
-            ui.report_line(f"{token}={colors[token]}")
+    header = ui.color_text("Palette", ui.colors["header"], bold=True)
+    lines = [
+        ui.kv_line("context", theme or "active", key_tone="header", value_tone="success"),
+        ui.kv_line("theme dir", str(theme_dir), key_tone="header", value_tone="info"),
+        "",
+    ]
+    ansi_tokens = [f"color{i}" for i in range(16) if f"color{i}" in colors]
+    other_tokens = [token for token in CANONICAL_TOKENS if token in colors and token not in ansi_tokens]
+
+    def append_grid(tokens: list[str], columns: int) -> None:
+        label_row: list[str] = []
+        value_row: list[str] = []
+        for idx, token in enumerate(tokens, start=1):
+            value = colors[token]
+            label_row.append(ui.color_cell(abbreviate_palette_token(token), value))
+            value_row.append(ui.color_cell(value, value))
+            if idx % columns == 0:
+                lines.append(" ".join(label_row))
+                lines.append(" ".join(value_row))
+                lines.append("")
+                label_row = []
+                value_row = []
+        if label_row:
+            lines.append(" ".join(label_row))
+            lines.append(" ".join(value_row))
+            lines.append("")
+
+    if ansi_tokens:
+        lines.append(ui.color_text("ANSI (color0-color15)", ui.colors["header"], bold=True))
+        append_grid(ansi_tokens, columns=8)
+
+    if other_tokens:
+        lines.append(ui.color_text("Core Tokens", ui.colors["header"], bold=True))
+        append_grid(other_tokens, columns=ui.max_grid_columns(cell_width=14))
+
+    ui.print_box(header, lines, tone="info")
     return 0
+
+
+def abbreviate_palette_token(token: str) -> str:
+    token_map = {
+        "background": "bg",
+        "foreground": "fg",
+        "selection_background": "sel_bg",
+        "selection_foreground": "sel_fg",
+        "active_border_color": "act_brdr",
+    }
+    if token in token_map:
+        return token_map[token]
+    return token
 
 
 def run_set_interactive(ui: InteractiveUI, theme: str | None) -> int:
